@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Bare-Metal Architecture: C++ Execution Model</title>
+    <style>
+        body { font-family: 'Consolas', monospace; background-color: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; display: flex; flex-direction: column; gap: 20px; }
+        .row { display: flex; gap: 20px; }
+        .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; flex: 1; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h2 { color: #58a6ff; font-size: 1.2em; border-bottom: 1px solid #30363d; padding-bottom: 10px; margin-top: 0; }
+        .code-line { padding: 4px 8px; margin: 2px 0; border-radius: 4px; border: 1px solid transparent; font-size: 0.85em; white-space: pre; }
+        .code-line.active { background-color: #1f6feb33; border-color: #1f6feb; }
+        .memory-block { border: 1px solid #30363d; margin-bottom: 10px; padding: 10px; border-radius: 4px; background: #0d1117; transition: 0.3s; }
+        .stack-frame { border-color: #238636; box-shadow: inset 0 0 10px rgba(35, 134, 54, 0.1); }
+        .btn { background: #238636; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-family: 'Consolas', monospace; font-size: 1em; width: 100%; transition: 0.2s; margin-bottom: 10px; }
+        .btn:hover { background: #2ea043; }
+        .address { color: #8b949e; font-size: 0.8em; }
+        .value { color: #79c0ff; font-weight: bold; margin-top: 5px; }
+        .glossary p { font-size: 0.9em; line-height: 1.5; color: #c9d1d9; }
+        .glossary strong { color: #79c0ff; }
+    </style>
+</head>
+<body>
+    <div class="panel glossary">
+        <h2>Hardware Glossary (For Beginners)</h2>
+        <p><strong>RIP (Instruction Pointer):</strong> Think of this as the CPU's "reading finger". It highlights the exact line of code it is currently executing in the read-only Code Segment. It jumps around when it hits a <code>while</code> loop or an <code>if</code> statement.</p>
+        <p><strong>RSP (Stack Pointer):</strong> Think of this as the memory bookmark. It tracks the "top" of your available RAM. It moves up to reserve space for variables, and it violently snaps back down to instantly destroy them when a function ends.</p>
+    </div>
+
+    <div class="row">
+        <div class="panel" style="flex: 1.5;">
+            <h2>.text Segment (Your Exact Code)</h2>
+            <div id="code"></div>
+            <div style="margin-top: 20px;">
+                <button class="btn" onclick="step()">Step Forward (Move RIP)</button>
+                <button class="btn" onclick="reset()" style="background: #da3633;">Reset Simulation</button>
+            </div>
+        </div>
+        <div class="panel">
+            <h2>RAM: The Stack (Data)</h2>
+            <div id="stack"></div>
+        </div>
+        <div class="panel">
+            <h2>CPU State</h2>
+            <div id="cpu"></div>
+        </div>
+    </div>
+
+    <script>
+        const codeLines = [
+            "void nameAge(std::string& name, int& age) {", // 0
+            "    std::cout << \"Enter your full name - \";", // 1
+            "    std::getline(std::cin, name);", // 2
+            "    while (true) {", // 3
+            "        std::cout << \"Enter your age - \";", // 4
+            "        std::cin >> age;", // 5
+            "        if (std::cin.fail()) {", // 6
+            "            std::cin.clear();", // 7
+            "            std::cin.ignore(1000, '\\n');", // 8
+            "            std::cout << \"Invalid input.\\n\";", // 9
+            "        } else {", // 10
+            "            std::cin.ignore(1000, '\\n');", // 11
+            "            break;", // 12
+            "        }", // 13
+            "    }", // 14
+            "}", // 15
+            "", // 16
+            "int main() {", // 17
+            "    std::string Name;", // 18
+            "    int Age = 0;", // 19
+            "    nameAge(Name, Age);", // 20
+            "    std::cout << \"Your name is \" << Name...", // 21
+            "}" // 22
+        ];
+
+        const steps = [
+            { codeIdx: 17, stack: [], cpu: "RSP: 0x2000\nRIP: 0x4011 (Line 17)\n\nProgram initialized. CPU enters main()." },
+            { codeIdx: 19, stack: [
+                { addr: "0x1FF0", label: "Age (4 bytes)", val: "0" },
+                { addr: "0x1FF4", label: "Name (32 bytes)", val: '\"\"' }
+            ], cpu: "RSP: 0x1FF0\nRIP: 0x4013 (Line 19)\n\nmain() allocates RAM. RSP moves to carve out 36 bytes." },
+            { codeIdx: 20, stack: [
+                { addr: "0x1FE8", label: "[System] Return Address", val: "Jump back to Line 21" },
+                { addr: "0x1FF0", label: "Age (4 bytes)", val: "0" },
+                { addr: "0x1FF4", label: "Name (32 bytes)", val: '\"\"' }
+            ], cpu: "RSP: 0x1FE8\nRIP: 0x4014 (Line 20)\n\nCPU prepares to jump to nameAge(). Pushes the Return Address so it doesn't get lost." },
+            { codeIdx: 0, stack: [
+                { addr: "0x1FD8", label: "&age (8-byte pointer)", val: "-> 0x1FF0" },
+                { addr: "0x1FE0", label: "&name (8-byte pointer)", val: "-> 0x1FF4" },
+                { addr: "0x1FE8", label: "[System] Return Address", val: "Jump back to Line 21" },
+                { addr: "0x1FF0", label: "Age (4 bytes)", val: "0" },
+                { addr: "0x1FF4", label: "Name (32 bytes)", val: '\"\"' }
+            ], cpu: "RSP: 0x1FD8\nRIP: 0x4000 (Line 0)\n\nEnter nameAge(). RSP moves again to hold the 8-byte Reference Pointers." },
+            { codeIdx: 2, stack: [
+                { addr: "0x1FD8", label: "&age (8-byte pointer)", val: "-> 0x1FF0" },
+                { addr: "0x1FE0", label: "&name (8-byte pointer)", val: "-> 0x1FF4" },
+                { addr: "0x1FE8", label: "[System] Return Address", val: "Jump back to Line 21" },
+                { addr: "0x1FF0", label: "Age (4 bytes)", val: "0" },
+                { addr: "0x1FF4", label: "Name (32 bytes)", val: '\"Atharv\"' }
+            ], cpu: "RSP: 0x1FD8\nRIP: 0x4002 (Line 2)\n\ngetline updates Name via the pointer." },
+            { codeIdx: 3, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x4003 (Line 3)\n\nRIP hits the while loop. Note how RSP stays completely still!" },
+            { codeIdx: 5, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x4005 (Line 5)\n\nWaiting for input... (User types text: 'Eleven')" },
+            { codeIdx: 6, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x4006 (Line 6)\n\nHardware failbit trips. CPU jumps RIP into the if-branch." },
+            { codeIdx: 8, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x4008 (Line 8)\n\nScrubbing RAM buffer." },
+            { codeIdx: 3, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x4003 (Line 3)\n\nJUMP! RIP snaps backwards to the start of the loop. RSP is totally untouched." },
+            { codeIdx: 5, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x4005 (Line 5)\n\nWaiting for input... (User types number: '11')" },
+            { codeIdx: 10, stack: [
+                { addr: "0x1FD8", label: "&age (8-byte pointer)", val: "-> 0x1FF0" },
+                { addr: "0x1FE0", label: "&name (8-byte pointer)", val: "-> 0x1FF4" },
+                { addr: "0x1FE8", label: "[System] Return Address", val: "Jump back to Line 21" },
+                { addr: "0x1FF0", label: "Age (4 bytes)", val: "11" },
+                { addr: "0x1FF4", label: "Name (32 bytes)", val: '\"Atharv\"' }
+            ], cpu: "RSP: 0x1FD8\nRIP: 0x400A (Line 10)\n\nSuccess! CPU updates Age via the pointer, then RIP jumps into the else-branch." },
+            { codeIdx: 12, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x400C (Line 12)\n\nBreak instruction executed." },
+            { codeIdx: 15, stack: "keep", cpu: "RSP: 0x1FD8\nRIP: 0x400F (Line 15)\n\nRIP physically jumps out of the loop memory block." },
+            { codeIdx: 21, stack: [
+                { addr: "0x1FF0", label: "Age (4 bytes)", val: "11" },
+                { addr: "0x1FF4", label: "Name (32 bytes)", val: '\"Atharv\"' }
+            ], cpu: "RSP: 0x1FF0\nRIP: 0x4015 (Line 21)\n\nFunction ends. CPU reads the Return Address. RSP violently snaps back, annihilating the stack frame." },
+            { codeIdx: 22, stack: "keep", cpu: "RSP: 0x1FF0\nRIP: 0x4016 (Line 22)\n\nProgram exits." }
+        ];
+
+        let currentStep = 0;
+        let currentStack = [];
+
+        function render() {
+            const codeDiv = document.getElementById('code');
+            codeDiv.innerHTML = codeLines.map((line, i) => 
+                `<div class="code-line ${i === steps[currentStep].codeIdx ? 'active' : ''}">${line}</div>`
+            ).join('');
+
+            const stepData = steps[currentStep];
+            if (stepData.stack !== "keep") {
+                currentStack = stepData.stack;
+            }
+
+            const stackDiv = document.getElementById('stack');
+            stackDiv.innerHTML = currentStack.map((item, i) => 
+                `<div class="memory-block ${i < 3 && currentStack.length > 2 ? 'stack-frame' : ''}">
+                    <div class="address">${item.addr}</div>
+                    <div style="font-size: 0.9em; margin-top: 5px;">${item.label}</div>
+                    <div class="value">${item.val}</div>
+                </div>`
+            ).join('');
+
+            document.getElementById('cpu').innerHTML = `<pre style="color:#79c0ff; font-weight:bold; font-size:1.1em; background:#0d1117; padding:15px; border-radius:4px; border:1px solid #30363d; white-space: pre-wrap;">${stepData.cpu}</pre>`;
+        }
+
+        function step() {
+            if (currentStep < steps.length - 1) {
+                currentStep++;
+                render();
+            }
+        }
+
+        function reset() {
+            currentStep = 0;
+            render();
+        }
+
+        render();
+    </script>
+</body>
+</html>
